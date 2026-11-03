@@ -1,0 +1,220 @@
+﻿import os
+import shutil
+import chromadb
+from typing import Dict, List
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from pypdf import PdfReader
+from groq import Groq
+
+app = FastAPI(title="Day 12 Corrective RAG (CRAG) API", version="1.0.0")
+
+# Embedding model, Cross-Encoder, ChromaDB
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+chroma_client = chromadb.Client()
+collection = chroma_client.get_or_create_collection(name="day12_crag")
+
+# Groq Client
+groq_client = Groq(api_key="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")
+
+UPLOAD_DIR = "uploaded_docs_day12"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+SESSION_HISTORIES: Dict[str, List[Dict[str, str]]] = {}
+
+# Quality Threshold for Cross-Encoder re-ranker
+CONFIDENCE_THRESHOLD = 0.20
+
+class CRAGRequest(BaseModel):
+    session_id: str
+    question: str
+    target_doc: str = "ALL"
+
+class SourceDetail(BaseModel):
+    doc: str
+    page: int
+    score: float
+    text: str
+
+class CRAGResponse(BaseModel):
+    session_id: str
+    route_status: str
+    max_relevance_score: float
+    standalone_question: str
+    sources: list[SourceDetail]
+    answer: str
+
+@app.get("/")
+def home():
+    return {
+        "status": "Online",
+        "service": "Day 12 Corrective RAG (CRAG)",
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+        "indexed_chunks": collection.count()
+    }
+
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    reader = PdfReader(file_path)
+    total_added = 0
+
+    for page_idx, page in enumerate(reader.pages):
+        text = page.extract_text()
+        if not text:
+            continue
+
+        words = text.split()
+        chunk_size = 60
+        chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
+        for c_idx, chunk in enumerate(chunks):
+            doc_id = f"{file.filename}_p{page_idx + 1}_c{c_idx}"
+            vector = embed_model.encode(chunk).tolist()
+
+            collection.add(
+                documents=[chunk],
+                embeddings=[vector],
+                metadatas=[{"source": file.filename, "page": page_idx + 1}],
+                ids=[doc_id]
+            )
+            total_added += 1
+
+    return {
+        "status": "Success",
+        "filename": file.filename,
+        "chunks_indexed": total_added,
+        "total_collection_chunks": collection.count()
+    }
+
+def rewrite_query(history: List[Dict[str, str]], question: str) -> str:
+    if not history:
+        return question
+
+    history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-4:]])
+    prompt = f"""Given conversation history and follow-up question, rewrite to a self-contained query.
+Return ONLY the rewritten query.
+
+History:
+{history_str}
+
+Follow-up: {question}
+Rewritten Query:"""
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0
+        )
+        return completion.choices[0].message.content.strip() or question
+    except Exception:
+        return question
+
+@app.post("/chat", response_model=CRAGResponse)
+def crag_chat(payload: CRAGRequest):
+    if not payload.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    session_id = payload.session_id
+    if session_id not in SESSION_HISTORIES:
+        SESSION_HISTORIES[session_id] = []
+    history = SESSION_HISTORIES[session_id]
+
+    if collection.count() == 0:
+        raise HTTPException(status_code=400, detail="No documents indexed. Upload a PDF first.")
+
+    standalone_query = rewrite_query(history, payload.question)
+    query_vector = embed_model.encode(standalone_query).tolist()
+    where_filter = {"source": payload.target_doc} if payload.target_doc != "ALL" else None
+
+    # Retrieve candidate chunks
+    n_candidates = min(4, collection.count())
+    results = collection.query(
+        query_embeddings=[query_vector],
+        n_results=n_candidates,
+        where=where_filter
+    )
+
+    if not results['documents'] or not results['documents'][0]:
+        raise HTTPException(status_code=404, detail="No documents found.")
+
+    candidates = results['documents'][0]
+    metas = results['metadatas'][0]
+
+    # Cross-Encoder Re-ranking
+    pair_inputs = [[standalone_query, doc_text] for doc_text in candidates]
+    scores = reranker.predict(pair_inputs)
+    ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:2]
+
+    selected_sources = []
+    combined_context = []
+    top_score = float(scores[ranked_indices[0]]) if ranked_indices else -1.0
+
+    for rank, idx in enumerate(ranked_indices):
+        chunk_text = candidates[idx]
+        meta = metas[idx]
+        score = float(scores[idx])
+
+        selected_sources.append(SourceDetail(
+            doc=meta.get("source", "Unknown"),
+            page=meta.get("page", 0),
+            score=round(score, 3),
+            text=chunk_text
+        ))
+        combined_context.append(f"[Source {rank+1}: {meta.get('source')} (Page {meta.get('page')})]\n{chunk_text}")
+
+    context_str = "\n\n".join(combined_context)
+
+    # Corrective Decision Logic
+    if top_score >= CONFIDENCE_THRESHOLD:
+        route_status = "DOCUMENT_GROUNDED"
+        system_prompt = (
+            "You are a precise document expert. The retrieved context is highly relevant. "
+            "Answer directly from the context. Quote key document points where applicable."
+        )
+        user_content = f"--- VERIFIED CONTEXT ---\n{context_str}\n\n--- QUESTION ---\n{payload.question}"
+    else:
+        # Fallback Triggered due to low retrieval confidence
+        route_status = "FALLBACK_CORRECTED (Low Context Confidence)"
+        system_prompt = (
+            "You are an enterprise AI. The user's query did not have high-confidence matches in the uploaded private document. "
+            "Explicitly start by informing the user that this specific detail was NOT found in the uploaded documents, "
+            "then provide an accurate, helpful general answer using your broader knowledge."
+        )
+        user_content = f"The user asked: '{payload.question}', but retrieved document relevance score was too low ({top_score:.3f}). Provide helpful fallback guidance."
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in history[-4:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": user_content})
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=messages,
+            temperature=0.2
+        )
+        answer = completion.choices[0].message.content
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    history.append({"role": "user", "content": payload.question})
+    history.append({"role": "assistant", "content": answer})
+
+    return CRAGResponse(
+        session_id=session_id,
+        route_status=route_status,
+        max_relevance_score=round(top_score, 3),
+        standalone_question=standalone_query,
+        sources=selected_sources,
+        answer=answer
+    )
